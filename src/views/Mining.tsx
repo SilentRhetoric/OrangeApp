@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Input from '../components/Input';
 import Button from '../components/Button';
 import {
@@ -24,6 +24,8 @@ import bling from '../assets/bling.wav';
 import Timer from 'components/Timer';
 import dayjs from 'dayjs';
 import Modal from 'components/Modal';
+import { barX, plot, text } from '@observablehq/plot';
+import axios from 'axios';
 
 type AccountData = {
     assetBalance: number;
@@ -50,6 +52,7 @@ let miningMinute = 0;
 let miningSecond = 0;
 
 type MiningProps = {
+    nodeToken: string;
     nodeUrl: string;
     nodePort: number;
     indexerUrl: string;
@@ -59,8 +62,17 @@ type MiningProps = {
     isMainnet?: boolean;
 };
 
-function Mining({ nodeUrl, nodePort, indexerPort, indexerUrl, applicationId, assetId, isMainnet }: MiningProps) {
-    const client = new algosdk.Algodv2('', nodeUrl, nodePort);
+function Mining({
+    nodeToken,
+    nodeUrl,
+    nodePort,
+    indexerPort,
+    indexerUrl,
+    applicationId,
+    assetId,
+    isMainnet,
+}: MiningProps) {
+    const client = new algosdk.Algodv2(nodeToken, nodeUrl, nodePort);
     const [playBling] = useSound(bling);
     const account = useMemo(() => algosdk.generateAccount(), []);
     const [address, setAddress] = useState('');
@@ -90,6 +102,9 @@ function Mining({ nodeUrl, nodePort, indexerPort, indexerUrl, applicationId, ass
     const [pendingTxs, setPendingTxs] = useState(0);
 
     const [modalOpen, setModalOpen] = useState(false);
+
+    const [juicers, setJuicers] = useState<Juicer[]>([]);
+    const chartRef = useRef(null);
 
     const checkPasswordSet = async () => {
         setPasswordSet(await isPasswordSet());
@@ -187,6 +202,113 @@ function Mining({ nodeUrl, nodePort, indexerPort, indexerUrl, applicationId, ass
             lastMiner: keyToAddress(state, 'last_miner'),
         });
     };
+
+    /* 
+    Begin graphing addition
+    */
+    type Juicer = {
+        account: string;
+        effort: number;
+    };
+
+    async function processTxns(txns: any) {
+        let efforts: Record<string, any> = {};
+
+        for (const txn of txns) {
+            if (txn.txn.apid !== applicationId) continue;
+            if (txn.txn.apan) continue;
+            // console.group();
+            // console.log('txn:', txn);
+
+            const sender = algosdk.encodeAddress(txn.txn.snd);
+            // console.log('tx.snd addr encoded: ', sender);
+
+            const acctsArray = txn.txn.apat.map((acc: Uint8Array) => algosdk.encodeAddress(acc));
+            acctsArray.unshift(sender); // Txn.Sender is index 0 in accts array
+            // console.log('txn.apat array encoded: ', acctsArray);
+
+            const localDelta = txn.dt.ld;
+            // console.log('localDelta: ', localDelta);
+
+            for (const key in localDelta) {
+                const addr = acctsArray[key];
+                const effort = localDelta[key].effort.ui;
+                effort && (efforts[addr] = effort);
+            }
+            // console.groupEnd();
+        }
+        // console.log('efforts: ', efforts);
+
+        const effortsArray = Object.entries(efforts);
+        // console.log('effortsArray: ', effortsArray);
+
+        const juicers: Juicer[] = await Promise.all(
+            effortsArray.map(async (entry) => {
+                const effortAlgos = entry[1] / 1000000;
+                const acc = entry[0];
+                try {
+                    const nfdResponse = await axios.get(`https://api.nf.domains/nfd/lookup?address=${acc}`);
+                    const addr = nfdResponse.data[acc].name;
+                    return { account: addr, effort: effortAlgos };
+                } catch {
+                    const addr = `${acc.slice(0, 4)}...${acc.slice(-4)}`;
+                    return { account: addr, effort: effortAlgos };
+                }
+            }),
+        );
+
+        console.log('juicers: ', juicers);
+
+        setJuicers(juicers);
+    }
+
+    useEffect(() => {
+        const processBlock = async () => {
+            const blockResp = await client.block(lastBlock).do();
+            const txns = blockResp.block.txns;
+            if (txns?.length) {
+                await processTxns(blockResp.block.txns);
+            }
+        };
+        processBlock().catch(console.error);
+    }, [lastBlock]);
+
+    useEffect(() => {
+        if (juicers?.length === 0) return;
+
+        const graph = plot({
+            title: 'Active Juicer Efforts',
+            marginLeft: 140,
+            marginRight: 40,
+            x: { label: null, axis: null },
+            y: { label: null },
+            marks: [
+                barX(juicers, {
+                    y: 'account',
+                    x: 'effort',
+                    sort: { y: 'x', reverse: true },
+                    fill: 'orange',
+                    rx: 8,
+                    ry: 8,
+                }),
+
+                text(juicers, {
+                    text: 'effort',
+                    y: 'account',
+                    x: 'effort',
+                    textAnchor: 'start',
+                    dx: 2,
+                }),
+            ],
+        });
+
+        // @ts-ignore
+        chartRef.current.append(graph);
+        return () => graph.remove();
+    }, [juicers]);
+    /* 
+    End graphing addition
+    */
 
     useEffect(() => {
         if (
@@ -750,6 +872,7 @@ function Mining({ nodeUrl, nodePort, indexerPort, indexerUrl, applicationId, ass
                     </div>
                 </div>
                 <div className="flex flex-col justify-center text-center items-center flex-wrap gap-4 bg-orange-100 p-4 rounded-lg shadow-lg">
+                    <div ref={chartRef} className="font-bold"></div>
                     <div className="flex flex-col items-center justify-center">
                         <span className="font-bold heading text-2xl">Top recent juicers</span>
                         <span className="font-bold opacity-60 text-sm">Last 1000 rewards</span>
